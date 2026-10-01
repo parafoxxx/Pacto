@@ -1,0 +1,3 @@
+round,date_time_ist,eval_case,prompt_version,input_given,mock_scenario_queued,expected,what_the_agent_actually_did,pass_or_fail,what_we_changed
+0,2026-10-02,1 (pre-test on the server),n/a,"wellbeing_signal(""yaar bukhaar aa gaya tha"")",none,OK (an illness is not distress),"Returned STRUGGLING: the cue ""haar"" (defeat) matched inside ""bukhaar"" (fever)",fail,"Server fix: cues now match whole words only. Retest: OK for the fever sentence, STRUGGLING for ""main har baar fail hota hoon"""
+1,,1,v2,,,,,,
