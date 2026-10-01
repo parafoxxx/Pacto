@@ -91,6 +91,35 @@ def new_state() -> Dict[str, Any]:
 S = new_state()
 
 
+def seed(state: Dict[str, Any]) -> None:
+    """Recreate the demo pact on every start, so a sleeping or restarted free server never
+    loses it. Values come from environment variables, with safe test defaults."""
+    import os
+    env = os.environ.get
+    user = env("SEED_USER_ID", "mukund")
+    plan_id, sub_id = "v1-plan-pacto", f"v1-sub-{user}"
+    stake = int(env("SEED_STAKE_PAISE", "20000"))
+    vpa = env("SEED_USER_VPA", f"{user}@okaxis")
+    state["plans"][plan_id] = {"plan_id": plan_id, "status": "ACTIVE", "plan_name": "Pacto stake", "frequency": "AS",
+                               "amount": {"value": stake, "currency": "INR"},
+                               "max_limit_amount": {"value": stake * 5, "currency": "INR"}, "created_at": iso()}
+    state["balances"].setdefault(vpa, 5_000 if "lowbal" in vpa else 500_000)
+    state["subscriptions"][sub_id] = {
+        "subscription_id": sub_id, "plan_id": plan_id, "merchant_subscription_reference": f"pacto-{user}",
+        "customer": {"name": env("SEED_USER_NAME", user.title()), "vpa": vpa}, "status": "ACTIVE",
+        "mandate": {"type": "UPI_AUTOPAY", "non_revocable": True, "max_amount": {"value": stake * 5, "currency": "INR"},
+                    "frequency": "AS"},
+        "created_at": iso(), "failed_attempts": 0}
+    state["guardians"][sub_id] = {
+        "guardian_id": f"grd_{user}", "subscription_id": sub_id, "name": env("SEED_INSURER_NAME", "Vaibhav"),
+        "phone": env("SEED_INSURER_PHONE", "+910000000000"), "vpa": env("SEED_INSURER_VPA", "vaibhav@okaxis"),
+        "authorities": ["PAUSE", "CANCEL"], "override_codes_left": int(env("SEED_OVERRIDE_CODES", "4")),
+        "status": "ACTIVE", "created_at": iso()}
+
+
+seed(S)
+
+
 # ----------------------------------------------------------------------------- helpers
 def err(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"code": code, "message": message})
@@ -161,8 +190,8 @@ async def settings(payload: Dict[str, Any]):
 
 @app.post("/_mock/reset", tags=["test controls"])
 async def reset():
-    S.clear(); S.update(new_state())
-    return {"reset": True}
+    S.clear(); S.update(new_state()); seed(S)
+    return {"reset": True, "seeded": True}
 
 
 @app.get("/_mock/state", tags=["test controls"])
