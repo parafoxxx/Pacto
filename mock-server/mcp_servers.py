@@ -15,6 +15,9 @@ import json
 import os
 import uuid
 from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -339,5 +342,114 @@ def build_mcp(app, state: Dict[str, Any]):
         STRUGGLING or OK with the cues found. Calls POST /api/v1/insights/wellbeing."""
         return await call("POST", "/api/v1/insights/wellbeing", gnani=True,
                           json={"transcript": transcript, "language_code": language_code})
+
+    # ------------------------------------------------------------------ Telegram (REAL Bot API)
+    def tg_base() -> str:
+        return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+
+    async def tg(method: str, **params) -> dict:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token:
+            return {"ok": False, "error": "TELEGRAM_NOT_CONFIGURED", "description": "Set TELEGRAM_BOT_TOKEN on the server."}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"{tg_base()}/bot{token}/{method}", json=params)
+            return r.json()
+        except httpx.TimeoutException:
+            return {"ok": False, "error": "TIMEOUT", "description": "Telegram did not respond in time"}
+        except Exception as e:
+            return {"ok": False, "error": "TELEGRAM_ERROR", "description": str(e)[:200]}
+
+    async def gnani_stt_bytes(audio: bytes, ctype: str, language_code: str) -> dict:
+        if not os.environ.get("GNANI_API_KEY"):
+            return {"error": "GNANI_NOT_CONFIGURED"}
+        url = os.environ.get("GNANI_STT_URL", "https://api.vachana.ai/stt/v3")
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(url, headers=gnani_headers(), files={"file": ("voice_note", audio, ctype)},
+                                 data={"language_code": language_code})
+            return {"http_status": r.status_code, **r.json()}
+        except Exception as e:
+            return {"error": "GNANI_STT_FAILED", "message": str(e)[:200]}
+
+    async def poll_updates() -> None:
+        """Pull new Telegram updates into the server's message store (getUpdates)."""
+        res = await tg("getUpdates", offset=state["tg_offset"], timeout=0,
+                       allowed_updates=["message"])
+        for u in res.get("result", []) if res.get("ok") else []:
+            state["tg_offset"] = max(state["tg_offset"], u["update_id"] + 1)
+            m = u.get("message")
+            if not m:
+                continue
+            chat = m.get("chat", {})
+            frm = m.get("from", {})
+            item = {"message_id": m.get("message_id"), "chat_id": chat.get("id"),
+                    "chat_title": chat.get("title") or chat.get("first_name"),
+                    "from_id": frm.get("id"), "from_name": frm.get("first_name"),
+                    "from_username": frm.get("username"),
+                    "date": datetime.fromtimestamp(m.get("date", 0), IST).isoformat(timespec="seconds"),
+                    "text": m.get("text") or m.get("caption")}
+            v = m.get("voice") or m.get("audio")
+            if v:
+                item["voice"] = {"file_id": v.get("file_id"), "duration_s": v.get("duration")}
+            state["tg_messages"].append(item)
+        state["tg_messages"] = state["tg_messages"][-500:]
+
+    @every_server()
+    async def telegram_find_chats() -> dict:
+        """REAL Telegram: list the people and groups that have messaged the Pacto bot, with their chat_id.
+        Use this once to find a person's chat_id (they must send /start to the bot first)."""
+        await poll_updates()
+        chats = {}
+        for m in state["tg_messages"]:
+            chats[m["chat_id"]] = {"chat_id": m["chat_id"], "name": m["chat_title"],
+                                   "username": m.get("from_username"), "last_message_at": m["date"]}
+        return {"chats": list(chats.values())}
+
+    @every_server()
+    async def telegram_send_message(chat_id: str, text: str) -> dict:
+        """REAL Telegram: send a text message from the Pacto bot to a person or group (chat_id).
+        Calls the Telegram Bot API sendMessage."""
+        return await tg("sendMessage", chat_id=chat_id, text=text)
+
+    @every_server()
+    async def telegram_send_voice(chat_id: str, audio_url: str, caption: str = "") -> dict:
+        """REAL Telegram: send a voice note to a person (chat_id). Use the audio_url returned by speak
+        (Gnani). Calls the Telegram Bot API sendVoice, falling back to sendAudio."""
+        res = await tg("sendVoice", chat_id=chat_id, voice=audio_url, caption=caption)
+        if not res.get("ok"):
+            res = await tg("sendAudio", chat_id=chat_id, audio=audio_url, caption=caption)
+        return res
+
+    @every_server()
+    async def telegram_get_replies(chat_id: str, since: Optional[str] = None, transcribe: bool = True) -> dict:
+        """REAL Telegram + REAL Gnani: get messages a person sent to the Pacto bot in this chat, newest last.
+        since is an ISO time (+05:30); only messages after it are returned. Voice notes are downloaded from
+        Telegram and transcribed with Gnani (language hi-IN), returned in the transcript field."""
+        await poll_updates()
+        out = []
+        for m in state["tg_messages"]:
+            if str(m["chat_id"]) != str(chat_id):
+                continue
+            if since and datetime.fromisoformat(m["date"]) <= datetime.fromisoformat(since):
+                continue
+            item = dict(m)
+            if transcribe and m.get("voice") and "transcript" not in m:
+                f = await tg("getFile", file_id=m["voice"]["file_id"])
+                if f.get("ok"):
+                    path = f["result"]["file_path"]
+                    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                    try:
+                        async with httpx.AsyncClient(timeout=30) as c:
+                            a = await c.get(f"{tg_base()}/file/bot{token}/{path}")
+                        stt = await gnani_stt_bytes(a.content, "audio/ogg", "hi-IN")
+                        m["transcript"] = stt.get("transcript") or stt.get("text") or stt
+                    except Exception as e:
+                        m["transcript"] = {"error": "VOICE_DOWNLOAD_FAILED", "message": str(e)[:200]}
+                else:
+                    m["transcript"] = {"error": "GETFILE_FAILED", "detail": f}
+                item["transcript"] = m["transcript"]
+            out.append(item)
+        return {"chat_id": chat_id, "messages": out}
 
     return [("pinelabs", pine), ("delhivery", dl), ("gnani", gn)]
