@@ -60,8 +60,25 @@ def build_mcp(app, state: Dict[str, Any]):
         "Pine Labs subscriptions (UPI Autopay stakes) and payouts for Pacto. Amounts are in paise "
         "(Rs 200 = 20000). Tools marked NEW are capabilities Pine Labs does not offer today."),
         stateless_http=True, json_response=True, transport_security=NO_HOST_CHECK)
+    dl = FastMCP("delhivery-pacto", instructions=(
+        "Delhivery shipping for Pacto's protein rewards (mock of Delhivery's documented APIs), plus a NEW presence check."),
+        stateless_http=True, json_response=True, transport_security=NO_HOST_CHECK)
+    gn = FastMCP("gnani-pacto", instructions=(
+        "Gnani Vachana speech for Pacto. transcribe_voice_note and speak call the REAL Gnani API. "
+        "wellbeing_signal is NEW (not offered by Gnani today)."),
+        stateless_http=True, json_response=True, transport_security=NO_HOST_CHECK)
+    SERVERS = [pine, dl, gn]
 
-    @pine.tool()
+    def every_server():
+        """Register a tool on all three MCP servers, so a call routed to any of our
+        connector names finds it (the platform may file all tools under one name)."""
+        def wrap(fn):
+            for server in SERVERS:
+                server.add_tool(fn)
+            return fn
+        return wrap
+
+    @every_server()
     async def create_plan(plan_name: str, amount_paise: int, max_amount_paise: int) -> dict:
         """Create a subscription plan for a user's stake, charged only when presented ("AS" frequency).
         Calls POST /ps/api/v1/public/plans."""
@@ -70,7 +87,7 @@ def build_mcp(app, state: Dict[str, Any]):
             "frequency": "AS", "amount": money(amount_paise), "max_limit_amount": money(max_amount_paise),
             "merchant_plan_reference": "pacto-" + uuid.uuid4().hex[:8]})
 
-    @pine.tool()
+    @every_server()
     async def create_subscription(plan_id: str, user_name: str, user_vpa: str, merchant_subscription_reference: str,
                                   non_revocable: bool = True) -> dict:
         """Register the user's UPI Autopay mandate against a plan. The user approves it once in their UPI app.
@@ -80,13 +97,13 @@ def build_mcp(app, state: Dict[str, Any]):
             "customer": {"name": user_name, "vpa": user_vpa}, "allowed_payment_methods": ["UPI"],
             "non_revocable": non_revocable})
 
-    @pine.tool()
+    @every_server()
     async def get_subscription(subscription_id: str) -> dict:
         """Get a subscription's current status (ACTIVE, PAUSED, CANCELLED, HALTED) and mandate details.
         Calls GET /ps/api/v1/public/subscriptions/{subscription_id}."""
         return await call("GET", f"/ps/api/v1/public/subscriptions/{subscription_id}", bearer=True)
 
-    @pine.tool()
+    @every_server()
     async def create_presentation(subscription_id: str, amount_paise: int, merchant_presentation_reference: str,
                                   due_date: Optional[str] = None) -> dict:
         """Request a charge against the mandate after a verified missed session. Nothing is debited yet.
@@ -97,48 +114,48 @@ def build_mcp(app, state: Dict[str, Any]):
             body["due_date"] = due_date
         return await call("POST", f"/ps/api/v1/public/subscriptions/{subscription_id}/presentations", bearer=True, json=body)
 
-    @pine.tool()
+    @every_server()
     async def send_subscription_notification(presentation_id: str) -> dict:
         """Send the user the pre-debit notification. The debit is allowed only after debit_allowed_after.
         Calls POST /ps/api/v1/public/subscriptions/notify."""
         return await call("POST", "/ps/api/v1/public/subscriptions/notify", bearer=True, json={"presentation_id": presentation_id})
 
-    @pine.tool()
+    @every_server()
     async def create_debit(presentation_id: str) -> dict:
         """Execute the debit after the notice window. Returns status COMPLETED, FAILED (with failure_reason) or an error.
         Calls POST /ps/api/v1/public/subscriptions/execute."""
         return await call("POST", "/ps/api/v1/public/subscriptions/execute", bearer=True, json={"presentation_id": presentation_id})
 
-    @pine.tool()
+    @every_server()
     async def create_merchant_retry(presentation_id: str) -> dict:
         """Retry a FAILED debit. At most 3 retries; after that the subscription becomes HALTED.
         Calls POST /ps/api/v1/mandate/merchant-retry."""
         return await call("POST", "/ps/api/v1/mandate/merchant-retry", bearer=True, json={"presentation_id": presentation_id})
 
-    @pine.tool()
+    @every_server()
     async def get_presentation_by_merchant_reference(merchant_presentation_reference: str) -> dict:
         """Find a charge request by its reference (Pacto uses "miss-<session_id>"), to see its status
         (CREATED, PENDING, COMPLETED, FAILED, DELETED) and debit_allowed_after.
         Calls GET /ps/api/v1/public/presentations/reference/{merchant_presentation_reference}."""
         return await call("GET", f"/ps/api/v1/public/presentations/reference/{merchant_presentation_reference}", bearer=True)
 
-    @pine.tool()
+    @every_server()
     async def delete_presentation(presentation_id: str) -> dict:
         """Withdraw a pending charge request (for example while a dispute is checked).
         Calls DELETE /ps/api/v1/public/presentations/{presentation_id}."""
         return await call("DELETE", f"/ps/api/v1/public/presentations/{presentation_id}", bearer=True)
 
-    @pine.tool()
+    @every_server()
     async def resume_subscription(subscription_id: str) -> dict:
         """Resume a paused subscription. Calls POST /ps/api/v1/public/subscriptions/{subscription_id}/resume."""
         return await call("POST", f"/ps/api/v1/public/subscriptions/{subscription_id}/resume", bearer=True)
 
-    @pine.tool()
+    @every_server()
     async def verify_upi_id(vpa: str) -> dict:
         """Check that a UPI ID is valid before paying out to it. Calls POST /payment-option."""
         return await call("POST", "/payment-option", bearer=True, json={"payment_method": "UPI", "vpa": vpa})
 
-    @pine.tool()
+    @every_server()
     async def create_payout(client_reference_id: str, payee_name: str, vpa: str, amount_paise: int, remarks: str = "") -> dict:
         """Pay a forfeited stake to the Insurer, a charity or the juice shop over UPI. Reusing the same
         client_reference_id never pays twice. Calls POST /payouts/v3/payments/banks."""
@@ -146,12 +163,12 @@ def build_mcp(app, state: Dict[str, Any]):
             "clientReferenceId": client_reference_id, "payeeName": payee_name, "amount": money(amount_paise),
             "mode": "UPI", "vpa": vpa, "remarks": remarks})
 
-    @pine.tool()
+    @every_server()
     async def get_payouts(client_reference_id: str) -> dict:
         """Check a payout's status (SCHEDULED, SUCCESS, FAILED). Calls GET /payouts/v3/payments."""
         return await call("GET", "/payouts/v3/payments", bearer=True, params={"clientReferenceId": client_reference_id})
 
-    @pine.tool()
+    @every_server()
     async def add_guardian(subscription_id: str, name: str, phone: str, vpa: str, override_codes: int = 4) -> dict:
         """NEW (not offered by Pine Labs today): make the Insurer the guardian of a non-revocable mandate.
         Only the guardian can approve pausing or cancelling it; the user gets a few emergency override codes.
@@ -160,7 +177,7 @@ def build_mcp(app, state: Dict[str, Any]):
                           json={"name": name, "phone": phone, "vpa": vpa, "override_codes": override_codes,
                                 "authorities": ["PAUSE", "CANCEL"]})
 
-    @pine.tool()
+    @every_server()
     async def request_guardian_decision(subscription_id: str, request_type: str, reason: str,
                                         presentation_id: Optional[str] = None) -> dict:
         """NEW: ask the guardian (Insurer) to approve a PAUSE or CANCEL. If approved, the pending charge
@@ -168,20 +185,20 @@ def build_mcp(app, state: Dict[str, Any]):
         return await call("POST", f"/ps/api/v1/public/subscriptions/{subscription_id}/guardian/requests", bearer=True,
                           json={"type": request_type, "reason": reason, "presentation_id": presentation_id})
 
-    @pine.tool()
+    @every_server()
     async def get_guardian_requests(subscription_id: str) -> dict:
         """NEW: list the guardian, emergency codes left, and every pause/cancel request with its status
         (PENDING_GUARDIAN, APPROVED, REJECTED, OVERRIDDEN). Calls GET .../subscriptions/{subscription_id}/guardian/requests."""
         return await call("GET", f"/ps/api/v1/public/subscriptions/{subscription_id}/guardian/requests", bearer=True)
 
-    @pine.tool()
+    @every_server()
     async def record_guardian_decision(subscription_id: str, request_id: str, decision: str, guardian_phone: str) -> dict:
         """NEW: record the guardian's APPROVE or REJECT. Fails with NOT_GUARDIAN if guardian_phone is not
         the registered guardian. Calls POST .../guardian/requests/{request_id}/decision."""
         return await call("POST", f"/ps/api/v1/public/subscriptions/{subscription_id}/guardian/requests/{request_id}/decision",
                           bearer=True, json={"decision": decision, "guardian_phone": guardian_phone})
 
-    @pine.tool()
+    @every_server()
     async def use_emergency_code(subscription_id: str, request_id: str) -> dict:
         """NEW: overturn a REJECTED guardian request with one of the user's emergency codes. Money is protected;
         returns codes left. Calls POST .../guardian/requests/{request_id}/override."""
@@ -189,17 +206,15 @@ def build_mcp(app, state: Dict[str, Any]):
                           bearer=True)
 
     # ------------------------------------------------------------------ Delhivery
-    dl = FastMCP("delhivery-pacto", instructions=(
-        "Delhivery shipping for Pacto's protein rewards (mock of Delhivery's documented APIs), plus a NEW presence check."),
-        stateless_http=True, json_response=True, transport_security=NO_HOST_CHECK)
 
-    @dl.tool()
+
+    @every_server()
     async def check_pincode_serviceability(pincode: str) -> dict:
         """Check whether Delhivery delivers to a pincode. An empty delivery_codes list means not serviceable.
         Calls GET /c/api/pin-codes/json/?filter_codes=PIN."""
         return await call("GET", "/c/api/pin-codes/json/", token=True, params={"filter_codes": pincode})
 
-    @dl.tool()
+    @every_server()
     async def create_shipment(order_id: str, name: str, address: str, pincode: str, phone: str,
                               products_desc: str, hsn_code: str, seller_gst_tin: str, weight_grams: int = 1100) -> dict:
         """Create a prepaid shipment from the brand's warehouse (PACTO-PROTEIN-WH). Returns a waybill on success;
@@ -214,12 +229,12 @@ def build_mcp(app, state: Dict[str, Any]):
                           content="format=json&data=" + quote_plus(json.dumps(data)),
                           headers={"Content-Type": "application/x-www-form-urlencoded"})
 
-    @dl.tool()
+    @every_server()
     async def track_shipment(waybill: str) -> dict:
         """Track a shipment by waybill. Calls GET /api/v1/packages/json/?waybill=AWB."""
         return await call("GET", "/api/v1/packages/json/", token=True, params={"waybill": waybill})
 
-    @dl.tool()
+    @every_server()
     async def check_presence(user_id: str, gym_lat: float, gym_lng: float, window_start: str, window_end: str,
                              min_dwell_minutes: int = 45, radius_m: int = 120) -> dict:
         """NEW (not offered by Delhivery today): did the user arrive at the gym and stay? Uses the real GPS
@@ -230,10 +245,7 @@ def build_mcp(app, state: Dict[str, Any]):
             "place": {"lat": gym_lat, "lng": gym_lng, "radius_m": radius_m}, "min_dwell_minutes": min_dwell_minutes})
 
     # ------------------------------------------------------------------ Gnani (REAL speech)
-    gn = FastMCP("gnani-pacto", instructions=(
-        "Gnani Vachana speech for Pacto. transcribe_voice_note and speak call the REAL Gnani API. "
-        "wellbeing_signal is NEW (not offered by Gnani today)."),
-        stateless_http=True, json_response=True, transport_security=NO_HOST_CHECK)
+
 
     def gnani_headers() -> Dict[str, str]:
         h = {"X-API-Key-ID": os.environ.get("GNANI_API_KEY", "")}
@@ -255,7 +267,7 @@ def build_mcp(app, state: Dict[str, Any]):
             r.raise_for_status()
             return r.content, r.headers.get("content-type", "audio/mpeg")
 
-    @gn.tool()
+    @every_server()
     async def transcribe_voice_note(audio_url: str, language_code: str = "hi-IN") -> dict:
         """REAL Gnani speech-to-text. Downloads the voice note at audio_url and transcribes it.
         Use language_code hi-IN for Hindi or Hinglish. Calls Gnani POST /stt/v3."""
@@ -277,7 +289,7 @@ def build_mcp(app, state: Dict[str, Any]):
         except Exception:
             return {"http_status": r.status_code, "error": "MALFORMED_RESPONSE", "raw_response": r.text[:300]}
 
-    @gn.tool()
+    @every_server()
     async def speak(text: str, voice: str = "Karan", language_code: str = "hi-IN") -> dict:
         """REAL Gnani text-to-speech. Returns audio_url, a public link to the spoken reply that can be sent
         as a voice note or link. Calls Gnani POST /api/v1/tts/sse."""
@@ -321,7 +333,7 @@ def build_mcp(app, state: Dict[str, Any]):
         base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
         return {"http_status": r.status_code, "audio_url": f"{base}/audio/{aid}.mp3", "bytes": len(audio)}
 
-    @gn.tool()
+    @every_server()
     async def wellbeing_signal(transcript: str, language_code: str = "hi-IN") -> dict:
         """NEW (not offered by Gnani today): does the speaker sound like they are struggling? Returns signal
         STRUGGLING or OK with the cues found. Calls POST /api/v1/insights/wellbeing."""
