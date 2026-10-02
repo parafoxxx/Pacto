@@ -84,6 +84,8 @@ def new_state() -> Dict[str, Any]:
         "warehouses": {"PACTO-PROTEIN-WH"},
         "pings": [],       # real GPS check-ins sent from the user's phone
         "audio": {},       # Gnani text-to-speech replies, served at /audio/<id>.mp3
+        "tg_offset": 0,    # Telegram getUpdates offset
+        "tg_messages": [], # Telegram messages received by the Pacto bot
         "log": [],
     }
 
