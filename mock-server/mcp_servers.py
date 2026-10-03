@@ -460,6 +460,15 @@ def build_mcp(app, state: Dict[str, Any]):
         params = {"since": since} if since else None
         return await call("GET", f"/api/v1/focus/{user_id}", params=params)
 
+    @every_server()
+    async def get_walks(user_id: str, since: Optional[str] = None) -> dict:
+        """NEW (presence and activity): GPS walks the user recorded on the Pacto walk page (/walk/<user_id>).
+        verdict is VERIFIED (goal distance at a plausible walking speed), TOO_SHORT, SUSPICIOUS (vehicle speed or
+        implausible average), INSUFFICIENT_DATA or IN_PROGRESS, with distance_km, duration and speeds.
+        since filters by start time (ISO, +05:30). Calls GET /api/v1/walk/{user_id}."""
+        params = {"since": since} if since else None
+        return await call("GET", f"/api/v1/walk/{user_id}", params=params)
+
     # ------------------------------------------------------------------ Telegram (REAL Bot API)
     def tg_base() -> str:
         return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
