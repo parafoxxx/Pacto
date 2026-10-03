@@ -371,6 +371,86 @@ def build_mcp(app, state: Dict[str, Any]):
         """Pine Labs Brand Wallet: the user's coin balance. Calls POST /payment-option/wallet/balance."""
         return await call("POST", "/payment-option/wallet/balance", bearer=True, json={"wallet_id": wallet_id})
 
+    # ------------------------------------------------------------------ Pine Labs Plural (REAL UAT API)
+    pl_token: Dict[str, Any] = {}
+
+    def pl_base() -> str:
+        return os.environ.get("PINELABS_BASE_URL", "https://pluraluat.v2.pinepg.in").rstrip("/")
+
+    def pl_headers(token: Optional[str] = None) -> Dict[str, str]:
+        from datetime import timezone as _tz
+        h = {"Content-Type": "application/json", "Request-ID": str(uuid.uuid4()),
+             "Request-Timestamp": datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if token:
+            h["Authorization"] = f"Bearer {token}"
+        return h
+
+    async def pl_auth() -> Any:
+        import time as _t
+        if pl_token.get("token") and pl_token.get("exp", 0) > _t.time() + 60:
+            return pl_token["token"]
+        cid, sec = os.environ.get("PINELABS_CLIENT_ID"), os.environ.get("PINELABS_CLIENT_SECRET")
+        if not cid or not sec:
+            return {"error": "PINELABS_NOT_CONFIGURED", "message": "Set PINELABS_CLIENT_ID and PINELABS_CLIENT_SECRET on the server."}
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(f"{pl_base()}/api/auth/v1/token", headers=pl_headers(),
+                                 json={"client_id": cid, "client_secret": sec, "grant_type": "client_credentials"})
+            body = r.json()
+        except Exception as e:
+            return {"error": "PINELABS_AUTH_FAILED", "message": str(e)[:200]}
+        if r.status_code != 200 or "access_token" not in body:
+            return {"error": "PINELABS_AUTH_FAILED", "http_status": r.status_code, "response": body}
+        pl_token.update(token=body["access_token"], exp=_t.time() + 50 * 60)
+        return pl_token["token"]
+
+    async def pl_call(method: str, path: str, body: Optional[dict] = None) -> dict:
+        tok = await pl_auth()
+        if isinstance(tok, dict):
+            return tok
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.request(method, f"{pl_base()}{path}", headers=pl_headers(tok), json=body)
+        except httpx.TimeoutException:
+            return {"error": "TIMEOUT", "message": "Pine Labs did not respond in time. Check the link status before retrying."}
+        try:
+            data = r.json()
+        except Exception:
+            return {"http_status": r.status_code, "error": "MALFORMED_RESPONSE", "raw_response": r.text[:300]}
+        return {"http_status": r.status_code, **data} if isinstance(data, dict) else {"http_status": r.status_code, "data": data}
+
+    @every_server()
+    async def pinelabs_create_payment_link(amount_paise: int, merchant_payment_link_reference: str, description: str,
+                                           customer_name: str = "", customer_phone: str = "",
+                                           customer_email: str = "", expire_minutes: int = 120) -> dict:
+        """REAL Pine Labs (Plural UAT): create a payment link to collect a stake. amount_paise e.g. 20000 = Rs 200.
+        Use reference "stake-<session_id>" (unique). Returns payment_link_id and the link URL to send the user.
+        Calls POST /api/pay/v1/paymentlink."""
+        from datetime import timezone as _tz
+        body: Dict[str, Any] = {
+            "amount": {"value": int(amount_paise), "currency": "INR"},
+            "description": description,
+            "merchant_payment_link_reference": merchant_payment_link_reference,
+            "expire_by": (datetime.now(_tz.utc) + timedelta(minutes=int(expire_minutes))).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        cust = {k: v for k, v in {"first_name": customer_name, "mobile_number": customer_phone,
+                                    "email_id": customer_email, "country_code": "91" if customer_phone else ""}.items() if v}
+        if cust:
+            body["customer"] = cust
+        return await pl_call("POST", "/api/pay/v1/paymentlink", body)
+
+    @every_server()
+    async def pinelabs_get_payment_link(payment_link_id: str) -> dict:
+        """REAL Pine Labs (Plural UAT): get a payment link's status: CREATED, CLICKED, PAYMENT_INITIATED,
+        PROCESSED (paid), CANCELLED or EXPIRED. Calls GET /api/pay/v1/paymentlink/{payment_link_id}."""
+        return await pl_call("GET", f"/api/pay/v1/paymentlink/{payment_link_id}")
+
+    @every_server()
+    async def pinelabs_cancel_payment_link(payment_link_id: str) -> dict:
+        """REAL Pine Labs (Plural UAT): cancel an unpaid payment link (e.g. the Insurer accepted a pause or proof).
+        Calls PUT /api/pay/v1/paymentlink/{payment_link_id}/cancel."""
+        return await pl_call("PUT", f"/api/pay/v1/paymentlink/{payment_link_id}/cancel")
+
     # ------------------------------------------------------------------ Telegram (REAL Bot API)
     def tg_base() -> str:
         return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
