@@ -84,6 +84,9 @@ def new_state() -> Dict[str, Any]:
         "warehouses": {"PACTO-PROTEIN-WH"},
         "pings": [],       # real GPS check-ins sent from the user's phone
         "audio": {},       # Gnani text-to-speech replies, served at /audio/<id>.mp3
+        "wallets": {},     # Pine Labs Brand Wallets (coins), by wallet_id
+        "wallet_loads": {},  # load reference -> result (idempotent)
+        "sessions": {},    # attendance outcomes per user: {user_id: {session_id: outcome}}
         "tg_offset": 0,    # Telegram getUpdates offset
         "tg_messages": [], # Telegram messages received by the Pacto bot
         "log": [],
@@ -117,6 +120,9 @@ def seed(state: Dict[str, Any]) -> None:
         "phone": env("SEED_INSURER_PHONE", "+910000000000"), "vpa": env("SEED_INSURER_VPA", "vaibhav@okaxis"),
         "authorities": ["PAUSE", "CANCEL"], "override_codes_left": int(env("SEED_OVERRIDE_CODES", "4")),
         "status": "ACTIVE", "created_at": iso()}
+    state["wallets"][f"bw-{user}"] = {"wallet_id": f"bw-{user}", "customer_id": user, "wallet_name": "Pacto coins",
+                                      "balance": {"value": 0, "currency": "COINS"}, "status": "ACTIVE",
+                                      "created_at": iso()}
 
 
 seed(S)
@@ -579,6 +585,95 @@ async def guardian_override(subscription_id: str, request_id: str, authorization
     req["status"] = "OVERRIDDEN"; req["overridden_at"] = iso(); apply_request(req)
     return {**req, "override_codes_left": g["override_codes_left"],
             "subscription_status": S["subscriptions"][subscription_id]["status"]}
+
+
+# ----------------------------------------------------------------------------- Pine Labs: Brand Wallet (coins)
+@app.post("/payment-option/create/wallet", tags=["Pine Labs"])
+async def create_wallet(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    """Create a closed-loop Brand Wallet. Pacto keeps coins here; they can only be spent in the marketplace."""
+    require_bearer(authorization)
+    cid = payload.get("customer_id")
+    if not cid:
+        return err(400, "INVALID_REQUEST", "customer_id is required")
+    wid = payload.get("wallet_id") or f"bw-{cid}"
+    w = S["wallets"].setdefault(wid, {"wallet_id": wid, "customer_id": cid, "wallet_name": payload.get("wallet_name", "Pacto coins"),
+                                      "balance": {"value": 0, "currency": "COINS"}, "status": "ACTIVE", "created_at": iso()})
+    return w
+
+
+@app.post("/payment-option/wallet/load", tags=["Pine Labs"])
+async def load_wallet(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    """Load coins into a Brand Wallet. The same reference never loads twice."""
+    require_bearer(authorization)
+    if (r := await chaos("pinelabs.wallet")) is not None and not isinstance(r, str):
+        return r
+    w = S["wallets"].get(payload.get("wallet_id", ""))
+    if not w:
+        return err(404, "WALLET_NOT_FOUND", "No such wallet")
+    ref = payload.get("reference")
+    if not ref:
+        return err(400, "INVALID_REQUEST", "reference is required")
+    if ref in S["wallet_loads"]:
+        return {**S["wallet_loads"][ref], "duplicate": True, "balance": dict(w["balance"]),
+                "note": "This reference was already loaded; no coins added."}
+    amount = money(payload.get("amount"))
+    if amount <= 0:
+        return err(400, "INVALID_AMOUNT", "amount must be positive")
+    w["balance"]["value"] += amount
+    res = {"wallet_id": w["wallet_id"], "reference": ref, "loaded": amount, "status": "SUCCESS",
+           "balance": dict(w["balance"]), "loaded_at": iso()}
+    S["wallet_loads"][ref] = res
+    return res
+
+
+@app.post("/payment-option/wallet/balance", tags=["Pine Labs"])
+async def wallet_balance(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    require_bearer(authorization)
+    w = S["wallets"].get(payload.get("wallet_id", ""))
+    if not w:
+        return err(404, "WALLET_NOT_FOUND", "No such wallet")
+    return {"wallet_id": w["wallet_id"], "balance": dict(w["balance"]), "status": w["status"]}
+
+
+# ----------------------------------------------------------------------------- NEW 2 (Delhivery presence): attendance history and streak
+COINS_PER_SESSION, STREAK_BONUS_EVERY, STREAK_BONUS = 10, 7, 50
+
+
+def streak_of(user_id: str) -> Dict[str, int]:
+    hist = sorted(S["sessions"].get(user_id, {}).items())
+    cur = best = 0
+    for _, o in hist:
+        if o["outcome"] == "ATTENDED":
+            cur += 1; best = max(best, cur)
+        elif o["outcome"] in ("MISSED", "CODE_USED"):
+            cur = 0
+    return {"current_streak": cur, "best_streak": best, "sessions_recorded": len(hist)}
+
+
+@app.post("/api/v1/geofence/attendance", tags=["NEW: Delhivery presence"])
+async def record_attendance(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    """NEW: record a session's outcome (ATTENDED, MISSED, PAUSED, CODE_USED) and return the streak and the coins
+    earned. Recording the same session again updates it instead of counting twice."""
+    require_token(authorization)
+    uid, sid, outcome = payload.get("user_id"), payload.get("session_id"), payload.get("outcome")
+    if not uid or not sid or outcome not in ("ATTENDED", "MISSED", "PAUSED", "CODE_USED"):
+        return JSONResponse(status_code=400, content={"error": "user_id, session_id and outcome (ATTENDED, MISSED, PAUSED, CODE_USED) are required"})
+    prev = S["sessions"].setdefault(uid, {}).get(sid)
+    S["sessions"][uid][sid] = {"outcome": outcome, "recorded_at": iso()}
+    st = streak_of(uid)
+    coins = 0
+    if outcome == "ATTENDED" and (not prev or prev["outcome"] != "ATTENDED"):
+        coins = COINS_PER_SESSION + (STREAK_BONUS if st["current_streak"] % STREAK_BONUS_EVERY == 0 else 0)
+    return {"user_id": uid, "session_id": sid, "outcome": outcome, **st, "coins_to_award": coins,
+            "coin_reference": f"coins-{sid}" if coins else None,
+            "note": "Streak breaks on MISSED or CODE_USED; PAUSED leaves it unchanged."}
+
+
+@app.get("/api/v1/geofence/attendance/{user_id}", tags=["NEW: Delhivery presence"])
+async def attendance_history(user_id: str, authorization: Optional[str] = Header(None)):
+    require_token(authorization)
+    return {"user_id": user_id, **streak_of(user_id),
+            "sessions": [{"session_id": k, **v} for k, v in sorted(S["sessions"].get(user_id, {}).items())]}
 
 
 # ----------------------------------------------------------------------------- Delhivery (mock of documented APIs)
