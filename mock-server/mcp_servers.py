@@ -284,7 +284,7 @@ def build_mcp(app, state: Dict[str, Any]):
         try:
             async with httpx.AsyncClient(timeout=60) as c:
                 r = await c.post(url, headers=gnani_headers(),
-                                 files={"file": ("voice_note", audio, ctype)}, data={"language_code": language_code})
+                                 files={os.environ.get("GNANI_STT_FILE_FIELD", "audio_file"): ("voice_note.ogg", audio, ctype)}, data={"language_code": language_code})
         except httpx.TimeoutException:
             return {"error": "TIMEOUT", "message": "Gnani speech-to-text timed out"}
         try:
@@ -366,16 +366,18 @@ def build_mcp(app, state: Dict[str, Any]):
         url = os.environ.get("GNANI_STT_URL", "https://api.vachana.ai/stt/v3")
         try:
             async with httpx.AsyncClient(timeout=60) as c:
-                r = await c.post(url, headers=gnani_headers(), files={"file": ("voice_note", audio, ctype)},
+                r = await c.post(url, headers=gnani_headers(), files={os.environ.get("GNANI_STT_FILE_FIELD", "audio_file"): ("voice_note.ogg", audio, ctype)},
                                  data={"language_code": language_code})
             return {"http_status": r.status_code, **r.json()}
         except Exception as e:
             return {"error": "GNANI_STT_FAILED", "message": str(e)[:200]}
 
-    async def poll_updates() -> None:
+    async def poll_updates() -> dict:
         """Pull new Telegram updates into the server's message store (getUpdates)."""
         res = await tg("getUpdates", offset=state["tg_offset"], timeout=0,
                        allowed_updates=["message"])
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or res.get("description") or res}
         for u in res.get("result", []) if res.get("ok") else []:
             state["tg_offset"] = max(state["tg_offset"], u["update_id"] + 1)
             m = u.get("message")
@@ -394,6 +396,7 @@ def build_mcp(app, state: Dict[str, Any]):
                 item["voice"] = {"file_id": v.get("file_id"), "duration_s": v.get("duration")}
             state["tg_messages"].append(item)
         state["tg_messages"] = state["tg_messages"][-500:]
+        return {"ok": True, "new_updates": len(res.get("result", []))}
 
     @every_server()
     async def telegram_find_chats() -> dict:
@@ -426,13 +429,19 @@ def build_mcp(app, state: Dict[str, Any]):
         """REAL Telegram + REAL Gnani: get messages a person sent to the Pacto bot in this chat, newest last.
         since is an ISO time (+05:30); only messages after it are returned. Voice notes are downloaded from
         Telegram and transcribed with Gnani (language hi-IN), returned in the transcript field."""
-        await poll_updates()
+        poll = await poll_updates()
+        since_dt, since_note = None, None
+        if since:
+            try:
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if since_dt.tzinfo is None:
+                    since_dt = since_dt.replace(tzinfo=IST)
+            except Exception:
+                since_note = f"Ignored since={since!r}: not an ISO time"
+        in_chat = [m for m in state["tg_messages"] if str(m["chat_id"]).strip() == str(chat_id).strip()]
+        selected = [m for m in in_chat if not since_dt or datetime.fromisoformat(m["date"]) > since_dt]
         out = []
-        for m in state["tg_messages"]:
-            if str(m["chat_id"]) != str(chat_id):
-                continue
-            if since and datetime.fromisoformat(m["date"]) <= datetime.fromisoformat(since):
-                continue
+        for m in selected:
             item = dict(m)
             if transcribe and m.get("voice") and "transcript" not in m:
                 f = await tg("getFile", file_id=m["voice"]["file_id"])
@@ -450,6 +459,18 @@ def build_mcp(app, state: Dict[str, Any]):
                     m["transcript"] = {"error": "GETFILE_FAILED", "detail": f}
                 item["transcript"] = m["transcript"]
             out.append(item)
-        return {"chat_id": chat_id, "messages": out}
+        result = {"chat_id": chat_id, "messages": out,
+                  "total_messages_in_this_chat": len(in_chat),
+                  "latest_message_at": in_chat[-1]["date"] if in_chat else None,
+                  "telegram_poll": poll}
+        if since_note:
+            result["note"] = since_note
+        if in_chat and not out:
+            result["note"] = (f"No messages after since={since}. The latest message in this chat is at "
+                              f"{in_chat[-1]['date']}: {in_chat[-1].get('text') or '[voice note]'}")
+        if not in_chat:
+            known = sorted({str(m['chat_id']) for m in state['tg_messages']})
+            result["note"] = f"No messages from chat_id {chat_id}. Chats with messages: {known}"
+        return result
 
     return [("pinelabs", pine), ("delhivery", dl), ("gnani", gn)]
