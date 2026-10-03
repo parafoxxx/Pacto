@@ -88,6 +88,7 @@ def new_state() -> Dict[str, Any]:
         "wallet_loads": {},  # load reference -> result (idempotent)
         "sessions": {},    # attendance outcomes per user: {user_id: {session_id: outcome}}
         "focus": {},       # Forest-style focus sessions, by session_id
+        "walks": {},       # GPS walks, by walk_id
         "tg_offset": 0,    # Telegram getUpdates offset
         "tg_messages": [], # Telegram messages received by the Pacto bot
         "log": [],
@@ -171,7 +172,7 @@ def money(obj: Any) -> int:
 @app.middleware("http")
 async def request_log(request: Request, call_next):
     path = request.url.path
-    skip = path.startswith(("/_mock", "/pinelabs", "/delhivery", "/gnani", "/audio", "/checkin", "/focus", "/api/v1/focus"))
+    skip = path.startswith(("/_mock", "/pinelabs", "/delhivery", "/gnani", "/audio", "/checkin", "/focus", "/api/v1/focus", "/walk", "/api/v1/walk"))
     body = "" if skip else (await request.body())[:600].decode("utf-8", "replace")
     started = time.time()
     response = await call_next(request)
@@ -980,6 +981,134 @@ async def focus_page(user_id: str, goal: str = "Study"):
     from fastapi.responses import HTMLResponse
     import html as _h
     return HTMLResponse(FOCUS_HTML.replace("__USER__", _h.escape(user_id)).replace("__GOAL__", _h.escape(goal)))
+
+
+# ----------------------------------------------------------------------------- NEW 2 (presence and activity): GPS walk check
+WALK_MAX_ACCURACY_M = 50      # ignore GPS points less accurate than this
+WALK_VEHICLE_KMH = 25         # any stretch faster than this means a vehicle
+WALK_SPEED_RANGE = (2.0, 9.0)  # plausible average km/h for walking or jogging
+WALK_MAX_GAP_S = 150
+
+
+def walk_verdict(w: Dict[str, Any]) -> Dict[str, Any]:
+    pts = [p for p in w["points"] if (p.get("accuracy_m") or 0) <= WALK_MAX_ACCURACY_M]
+    dist_m, fastest, gaps = 0.0, 0.0, 0
+    for p, q in zip(pts, pts[1:]):
+        d = metres(p["lat"], p["lng"], q["lat"], q["lng"])
+        dt = q["t"] - p["t"]
+        if dt <= 0:
+            continue
+        if dt > WALK_MAX_GAP_S:
+            gaps += 1
+        if d < 3:          # GPS jitter while standing still
+            continue
+        dist_m += d
+        if dt >= 10:
+            fastest = max(fastest, d / dt * 3.6)
+    dur_s = (pts[-1]["t"] - pts[0]["t"]) if len(pts) >= 2 else 0
+    avg = (dist_m / dur_s * 3.6) if dur_s else 0.0
+    km = dist_m / 1000
+    if w["status"] == "IN_PROGRESS":
+        verdict, why = "IN_PROGRESS", "Walk not ended yet"
+    elif len(pts) < 4 or dur_s < 120:
+        verdict, why = "INSUFFICIENT_DATA", "Too few accurate GPS points or under 2 minutes of data"
+    elif dist_m < 50:
+        verdict, why = "TOO_SHORT", f"Barely moved ({dist_m:.0f} m)"
+    elif fastest > WALK_VEHICLE_KMH:
+        verdict, why = "SUSPICIOUS", f"A stretch at {fastest:.0f} km/h is vehicle speed"
+    elif not (WALK_SPEED_RANGE[0] <= avg <= WALK_SPEED_RANGE[1]):
+        verdict, why = "SUSPICIOUS", f"Average speed {avg:.1f} km/h is not a plausible walk"
+    elif km < w["target_km"]:
+        verdict, why = "TOO_SHORT", f"Walked {km:.2f} km of the {w['target_km']} km goal"
+    else:
+        verdict, why = "VERIFIED", f"Walked {km:.2f} km at {avg:.1f} km/h"
+    out = {k: v for k, v in w.items() if k != "points"}
+    out.update(verdict=verdict, reason=why, distance_km=round(km, 2), duration_min=round(dur_s / 60, 1),
+               avg_speed_kmh=round(avg, 1), fastest_stretch_kmh=round(fastest, 1),
+               gps_points=len(w["points"]), accurate_points=len(pts), data_gaps=gaps)
+    return out
+
+
+@app.post("/api/v1/walk/start", tags=["NEW: Delhivery presence"])
+async def walk_start(payload: Dict[str, Any]):
+    uid = payload.get("user_id")
+    if not uid:
+        return JSONResponse(status_code=400, content={"error": "user_id is required"})
+    wid = "walk-" + uuid.uuid4().hex[:10]
+    S["walks"][wid] = {"walk_id": wid, "user_id": uid, "target_km": float(payload.get("target_km", 2)),
+                       "status": "IN_PROGRESS", "started_at": iso(), "points": []}
+    return walk_verdict(S["walks"][wid])
+
+
+@app.post("/api/v1/walk/point", tags=["NEW: Delhivery presence"])
+async def walk_point(payload: Dict[str, Any]):
+    w = S["walks"].get(payload.get("walk_id", ""))
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "No such walk"})
+    if w["status"] != "IN_PROGRESS":
+        return walk_verdict(w)
+    w["points"].append({"lat": float(payload["lat"]), "lng": float(payload["lng"]),
+                        "accuracy_m": payload.get("accuracy_m"), "t": time.time()})
+    return walk_verdict(w)
+
+
+@app.post("/api/v1/walk/end", tags=["NEW: Delhivery presence"])
+async def walk_end(payload: Dict[str, Any]):
+    w = S["walks"].get(payload.get("walk_id", ""))
+    if not w:
+        return JSONResponse(status_code=404, content={"error": "No such walk"})
+    if w["status"] == "IN_PROGRESS":
+        w["status"], w["ended_at"] = "ENDED", iso()
+    return walk_verdict(w)
+
+
+@app.get("/api/v1/walk/{user_id}", tags=["NEW: Delhivery presence"])
+async def walk_list(user_id: str, since: Optional[str] = None):
+    items = [walk_verdict(w) for w in S["walks"].values() if w["user_id"] == user_id]
+    if since:
+        try:
+            s = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            s = s if s.tzinfo else s.replace(tzinfo=IST)
+            items = [i for i in items if datetime.fromisoformat(i["started_at"]) >= s]
+        except Exception:
+            pass
+    return {"user_id": user_id, "walks": items}
+
+
+WALK_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Pacto walk</title>
+<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:0 auto;padding:1.5rem 1.25rem;background:#F4F6F8;color:#18212E;text-align:center}
+h1{font-size:1.8rem;margin:.2rem 0}p{color:#56606E}#km{font-size:3.2rem;font-weight:700;font-variant-numeric:tabular-nums;margin:1rem 0 0}
+#sub{color:#56606E;margin-bottom:1rem}button{font-size:1.2rem;padding:1rem;border-radius:12px;border:0;width:100%;margin-top:.75rem;color:#fff}
+#start{background:#1F7A55}#end{background:#18212E;display:none}#msg{min-height:3rem;font-weight:600;margin-top:1rem}.fail{color:#B3261E}.ok{color:#1F7A55}</style></head>
+<body><h1>Pacto walk</h1><p>__USER__ &middot; goal __KM__ km. Keep this page open with the screen on while you walk.</p>
+<div id="km">0.00 km</div><div id="sub">Not started</div>
+<button id="start">Start walk</button><button id="end">End walk</button><div id="msg"></div>
+<script>
+var U='__USER__',TARGET=__KM__,wid=null,watch=null,lock=null,lastSent=0,t0=0,timer=null;
+function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()});}
+function show(v){document.getElementById('km').textContent=v.distance_km.toFixed(2)+' km';
+ var m=Math.floor((Date.now()-t0)/60000);document.getElementById('sub').textContent=m+' min · '+v.accurate_points+' GPS points';}
+document.getElementById('start').onclick=function(){if(!navigator.geolocation){document.getElementById('msg').textContent='This browser cannot share location.';return;}
+ post('/api/v1/walk/start',{user_id:U,target_km:TARGET}).then(function(w){wid=w.walk_id;t0=Date.now();
+  document.getElementById('start').style.display='none';document.getElementById('end').style.display='block';
+  if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(l){lock=l}).catch(function(){});
+  watch=navigator.geolocation.watchPosition(function(p){var now=Date.now();if(now-lastSent<15000)return;lastSent=now;
+   post('/api/v1/walk/point',{walk_id:wid,lat:p.coords.latitude,lng:p.coords.longitude,accuracy_m:p.coords.accuracy}).then(show);},
+   function(){document.getElementById('msg').textContent='Please allow location access.';},{enableHighAccuracy:true,maximumAge:5000,timeout:20000});});};
+document.getElementById('end').onclick=function(){if(watch!==null)navigator.geolocation.clearWatch(watch);if(lock)lock.release().catch(function(){});
+ post('/api/v1/walk/end',{walk_id:wid}).then(function(v){show(v);document.getElementById('end').style.display='none';var m=document.getElementById('msg');
+  m.className=v.verdict==='VERIFIED'?'ok':'fail';m.textContent=(v.verdict==='VERIFIED'?'Walk verified! ':'Not verified: ')+v.reason;});};
+document.addEventListener('visibilitychange',function(){if(!document.hidden&&wid&&navigator.wakeLock&&!lock)navigator.wakeLock.request('screen').then(function(l){lock=l}).catch(function(){});});
+</script></body></html>"""
+
+
+@app.get("/walk/{user_id}", tags=["Pacto app"])
+async def walk_page(user_id: str, km: float = 2.0):
+    from fastapi.responses import HTMLResponse
+    import html as _h
+    km = max(0.1, min(float(km), 50.0))
+    return HTMLResponse(WALK_HTML.replace("__USER__", _h.escape(user_id)).replace("__KM__", f"{km:g}"))
 
 
 # ----------------------------------------------------------------------------- Pacto check-in page (real phone GPS)
