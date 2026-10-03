@@ -87,6 +87,7 @@ def new_state() -> Dict[str, Any]:
         "wallets": {},     # Pine Labs Brand Wallets (coins), by wallet_id
         "wallet_loads": {},  # load reference -> result (idempotent)
         "sessions": {},    # attendance outcomes per user: {user_id: {session_id: outcome}}
+        "focus": {},       # Forest-style focus sessions, by session_id
         "tg_offset": 0,    # Telegram getUpdates offset
         "tg_messages": [], # Telegram messages received by the Pacto bot
         "log": [],
@@ -170,7 +171,7 @@ def money(obj: Any) -> int:
 @app.middleware("http")
 async def request_log(request: Request, call_next):
     path = request.url.path
-    skip = path.startswith(("/_mock", "/pinelabs", "/delhivery", "/gnani", "/audio", "/checkin"))
+    skip = path.startswith(("/_mock", "/pinelabs", "/delhivery", "/gnani", "/audio", "/checkin", "/focus", "/api/v1/focus"))
     body = "" if skip else (await request.body())[:600].decode("utf-8", "replace")
     started = time.time()
     response = await call_next(request)
@@ -858,6 +859,127 @@ async def wellbeing(payload: Dict[str, Any], x_api_key_id: Optional[str] = Heade
 @app.get("/", tags=["info"])
 async def root():
     return {"service": "Pacto mock server", "docs": "/docs", "openapi": "/openapi.json", "time": iso()}
+
+
+# ----------------------------------------------------------------------------- NEW 2 (presence and activity): Forest-style focus sessions
+FOCUS_GRACE_SECONDS = 10
+FOCUS_HEARTBEAT_TIMEOUT = 75
+
+
+def focus_status(f: Dict[str, Any]) -> Dict[str, Any]:
+    """Work out a focus session's true status from its events, whatever the page last said."""
+    now_t = time.time()
+    if f["status"] == "RUNNING":
+        if f.get("hidden_since") and now_t - f["hidden_since"] > FOCUS_GRACE_SECONDS:
+            f["status"], f["reason"] = "FAILED", "Left the focus page (switched app, home screen or locked phone)"
+            f["ended_at"] = iso(datetime.fromtimestamp(f["hidden_since"] + FOCUS_GRACE_SECONDS, IST))
+        elif now_t - f["last_seen"] > FOCUS_HEARTBEAT_TIMEOUT:
+            f["status"], f["reason"] = "ABANDONED", "The focus page stopped responding (closed or phone off)"
+            f["ended_at"] = iso(datetime.fromtimestamp(f["last_seen"], IST))
+    out = {k: v for k, v in f.items() if k not in ("hidden_since", "last_seen", "started_t")}
+    out["elapsed_minutes"] = round((min(now_t, f.get("ended_t", now_t)) - f["started_t"]) / 60, 1)
+    return out
+
+
+@app.post("/api/v1/focus/start", tags=["NEW: Delhivery presence"])
+async def focus_start(payload: Dict[str, Any]):
+    uid = payload.get("user_id")
+    minutes = int(payload.get("minutes", 25))
+    if not uid or minutes < 1 or minutes > 240:
+        return JSONResponse(status_code=400, content={"error": "user_id and minutes (1-240) are required"})
+    sid = "focus-" + uuid.uuid4().hex[:10]
+    now_t = time.time()
+    S["focus"][sid] = {"session_id": sid, "user_id": uid, "goal": payload.get("goal", "Study"), "minutes": minutes,
+                       "status": "RUNNING", "started_at": iso(), "ends_at": iso(now() + timedelta(minutes=minutes)),
+                       "exits": 0, "away_seconds": 0, "started_t": now_t, "last_seen": now_t, "hidden_since": None}
+    return {k: v for k, v in S["focus"][sid].items() if k not in ("hidden_since", "last_seen", "started_t")}
+
+
+@app.post("/api/v1/focus/event", tags=["NEW: Delhivery presence"])
+async def focus_event(request: Request):
+    """Page events: hidden (user left), visible (came back), heartbeat, complete. Accepts sendBeacon bodies."""
+    try:
+        payload = json.loads((await request.body()).decode() or "{}")
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+    f = S["focus"].get(payload.get("session_id", ""))
+    if not f:
+        return JSONResponse(status_code=404, content={"error": "No such focus session"})
+    focus_status(f)
+    if f["status"] != "RUNNING":
+        return focus_status(f)
+    now_t, ev = time.time(), payload.get("type")
+    f["last_seen"] = now_t
+    if ev == "hidden":
+        f["hidden_since"] = f["hidden_since"] or now_t
+        f["exits"] += 1
+    elif ev == "visible":
+        if f["hidden_since"]:
+            away = now_t - f["hidden_since"]
+            f["away_seconds"] += int(away)
+            f["hidden_since"] = None
+            if away > FOCUS_GRACE_SECONDS:
+                f["status"], f["reason"] = "FAILED", f"Away for {int(away)} seconds (limit {FOCUS_GRACE_SECONDS})"
+                f["ended_at"], f["ended_t"] = iso(), now_t
+    elif ev == "complete":
+        if now_t - f["started_t"] >= f["minutes"] * 60 - 5 and not f["hidden_since"]:
+            f["status"], f["ended_at"], f["ended_t"] = "COMPLETED", iso(), now_t
+        else:
+            return JSONResponse(status_code=409, content={"error": "Too early to complete", **focus_status(f)})
+    return focus_status(f)
+
+
+@app.get("/api/v1/focus/{user_id}", tags=["NEW: Delhivery presence"])
+async def focus_list(user_id: str, since: Optional[str] = None):
+    items = [focus_status(f) for f in S["focus"].values() if f["user_id"] == user_id]
+    if since:
+        try:
+            s = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            s = s if s.tzinfo else s.replace(tzinfo=IST)
+            items = [i for i in items if datetime.fromisoformat(i["started_at"]) >= s]
+        except Exception:
+            pass
+    return {"user_id": user_id, "grace_seconds": FOCUS_GRACE_SECONDS, "sessions": items}
+
+
+FOCUS_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Pacto focus</title>
+<style>body{font-family:system-ui,sans-serif;max-width:28rem;margin:0 auto;padding:1.5rem 1.25rem;background:#F4F6F8;color:#18212E;text-align:center}
+h1{font-size:1.8rem;margin:.2rem 0}p{color:#56606E}#tree{font-size:6rem;margin:1rem 0;transition:transform .5s}
+#time{font-size:3rem;font-weight:700;font-variant-numeric:tabular-nums}select,button{font-size:1.15rem;padding:.8rem 1rem;border-radius:12px;border:1px solid #CDD4DD}
+button{background:#1F7A55;color:#fff;border:0;width:100%;margin-top:.75rem}#msg{min-height:3rem;font-weight:600;margin-top:1rem}.fail{color:#B3261E}.ok{color:#1F7A55}</style></head>
+<body><h1>Pacto focus</h1><p>__USER__ &middot; __GOAL__. Stay on this page until the timer ends. Leave it for more than 10 seconds and the plant dies.</p>
+<div id="tree">🌱</div><div id="time">--:--</div>
+<div id="setup"><select id="mins"><option>1</option><option>15</option><option selected>25</option><option>45</option><option>60</option></select> minutes
+<button id="start">Start focus</button></div><div id="msg"></div>
+<script>
+var U='__USER__',G='__GOAL__',sid=null,end=0,tick=null,hb=null,lock=null,done=false;
+var preset=new URLSearchParams(location.search).get('minutes');if(preset){var o=document.createElement('option');o.text=preset;o.selected=true;document.getElementById('mins').add(o);}
+function post(t){if(!sid)return Promise.resolve();return fetch('/api/v1/focus/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,type:t})}).then(function(r){return r.json()});}
+function beacon(t){if(sid&&navigator.sendBeacon)navigator.sendBeacon('/api/v1/focus/event',new Blob([JSON.stringify({session_id:sid,type:t})],{type:'application/json'}));}
+function show(s){var m=document.getElementById('msg');if(s.status==='FAILED'||s.status==='ABANDONED'){finish();document.getElementById('tree').textContent='🥀';m.className='fail';m.textContent='Session failed: '+(s.reason||s.status);}
+ else if(s.status==='COMPLETED'){finish();document.getElementById('tree').textContent='🌳';m.className='ok';m.textContent='Focus complete! Pacto has recorded it.';}}
+function finish(){done=true;clearInterval(tick);clearInterval(hb);if(lock)lock.release().catch(function(){});}
+function grow(p){document.getElementById('tree').textContent=p<.34?'🌱':p<.67?'🌿':'🌳';}
+document.getElementById('start').onclick=function(){var mins=parseInt(document.getElementById('mins').value,10);
+ fetch('/api/v1/focus/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:U,minutes:mins,goal:G})}).then(function(r){return r.json()}).then(function(s){
+ sid=s.session_id;end=Date.now()+mins*60000;document.getElementById('setup').style.display='none';
+ if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(l){lock=l}).catch(function(){});
+ tick=setInterval(function(){var left=Math.max(0,end-Date.now());var mm=Math.floor(left/60000),ss=Math.floor(left%60000/1000);
+  document.getElementById('time').textContent=(mm<10?'0':'')+mm+':'+(ss<10?'0':'')+ss;grow(1-left/(mins*60000));
+  if(left===0&&!done){post('complete').then(show);clearInterval(tick);}},500);
+ hb=setInterval(function(){if(!document.hidden)post('heartbeat').then(show)},15000);});};
+document.addEventListener('visibilitychange',function(){if(!sid||done)return;if(document.hidden){beacon('hidden');}else{post('visible').then(show);
+ if(navigator.wakeLock&&!lock)navigator.wakeLock.request('screen').then(function(l){lock=l}).catch(function(){});}});
+window.addEventListener('pagehide',function(){if(sid&&!done)beacon('hidden');});
+</script></body></html>"""
+
+
+@app.get("/focus/{user_id}", tags=["Pacto app"])
+async def focus_page(user_id: str, goal: str = "Study"):
+    from fastapi.responses import HTMLResponse
+    import html as _h
+    return HTMLResponse(FOCUS_HTML.replace("__USER__", _h.escape(user_id)).replace("__GOAL__", _h.escape(goal)))
 
 
 # ----------------------------------------------------------------------------- Pacto check-in page (real phone GPS)
