@@ -451,6 +451,15 @@ def build_mcp(app, state: Dict[str, Any]):
         Calls PUT /api/pay/v1/paymentlink/{payment_link_id}/cancel."""
         return await pl_call("PUT", f"/api/pay/v1/paymentlink/{payment_link_id}/cancel")
 
+    @every_server()
+    async def get_focus_sessions(user_id: str, since: Optional[str] = None) -> dict:
+        """NEW (presence and activity): Forest-style focus sessions the user ran on the Pacto focus page
+        (/focus/<user_id>). status is COMPLETED (stayed on the page for the full time), FAILED (left the page
+        for more than 10 seconds), ABANDONED (page closed) or RUNNING. since filters by start time (ISO, +05:30).
+        Calls GET /api/v1/focus/{user_id}."""
+        params = {"since": since} if since else None
+        return await call("GET", f"/api/v1/focus/{user_id}", params=params)
+
     # ------------------------------------------------------------------ Telegram (REAL Bot API)
     def tg_base() -> str:
         return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
