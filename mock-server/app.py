@@ -198,7 +198,13 @@ async def reset():
 
 @app.get("/_mock/state", tags=["test controls"])
 async def state():
-    return {k: (sorted(v) if isinstance(v, set) else v) for k, v in S.items() if k != "log"}
+    return {k: (sorted(v) if isinstance(v, set) else v) for k, v in S.items() if k not in ("log", "audio")}
+
+
+@app.get("/_mock/telegram", tags=["test controls"])
+async def telegram_messages():
+    """Every Telegram message the Pacto bot has received since the server started."""
+    return {"offset": S["tg_offset"], "messages": S["tg_messages"]}
 
 
 @app.get("/_mock/log", tags=["test controls"])
