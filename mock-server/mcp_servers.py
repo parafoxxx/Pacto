@@ -343,6 +343,34 @@ def build_mcp(app, state: Dict[str, Any]):
         return await call("POST", "/api/v1/insights/wellbeing", gnani=True,
                           json={"transcript": transcript, "language_code": language_code})
 
+    # ------------------------------------------------------------------ Streaks and coins
+    @every_server()
+    async def record_session_outcome(user_id: str, session_id: str, outcome: str) -> dict:
+        """NEW (Delhivery presence): record a session's outcome: ATTENDED, MISSED, PAUSED or CODE_USED.
+        Returns current_streak, best_streak and coins_to_award (with coin_reference). Streak breaks on MISSED
+        or CODE_USED; PAUSED leaves it unchanged. Calls POST /api/v1/geofence/attendance."""
+        return await call("POST", "/api/v1/geofence/attendance", token=True,
+                          json={"user_id": user_id, "session_id": session_id, "outcome": outcome})
+
+    @every_server()
+    async def get_streak(user_id: str) -> dict:
+        """NEW (Delhivery presence): a user's current and best streak and every recorded session.
+        Calls GET /api/v1/geofence/attendance/{user_id}."""
+        return await call("GET", f"/api/v1/geofence/attendance/{user_id}", token=True)
+
+    @every_server()
+    async def load_coins(wallet_id: str, coins: int, reference: str) -> dict:
+        """Pine Labs Brand Wallet: add coins to the user's closed-loop wallet. Use the coin_reference from
+        record_session_outcome; the same reference never loads twice. Calls POST /payment-option/wallet/load."""
+        return await call("POST", "/payment-option/wallet/load", bearer=True,
+                          json={"wallet_id": wallet_id, "amount": {"value": int(coins), "currency": "COINS"},
+                                "reference": reference})
+
+    @every_server()
+    async def get_coin_balance(wallet_id: str) -> dict:
+        """Pine Labs Brand Wallet: the user's coin balance. Calls POST /payment-option/wallet/balance."""
+        return await call("POST", "/payment-option/wallet/balance", bearer=True, json={"wallet_id": wallet_id})
+
     # ------------------------------------------------------------------ Telegram (REAL Bot API)
     def tg_base() -> str:
         return os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
