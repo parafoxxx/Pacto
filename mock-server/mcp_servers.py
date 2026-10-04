@@ -433,6 +433,8 @@ def build_mcp(app, state: Dict[str, Any]):
             "merchant_payment_link_reference": merchant_payment_link_reference,
             "expire_by": (datetime.now(_tz.utc) + timedelta(minutes=int(expire_minutes))).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        from app import canon as _canon
+        merchant_payment_link_reference = _canon(merchant_payment_link_reference)
         prior = state.setdefault("pl_links", {}).get(merchant_payment_link_reference)
         if prior and prior.get("payment_link_id"):
             current = await pl_call("GET", f"/api/pay/v1/paymentlink/{prior['payment_link_id']}")
@@ -477,6 +479,77 @@ def build_mcp(app, state: Dict[str, Any]):
         since filters by start time (ISO, +05:30). Calls GET /api/v1/walk/{user_id}."""
         params = {"since": since} if since else None
         return await call("GET", f"/api/v1/walk/{user_id}", params=params)
+
+    @every_server()
+    async def get_session_state(user_id: str, session_start: str, user_chat_id: str = "", insurer_chat_id: str = "") -> dict:
+        """START HERE for every session. Gives the session's canonical session_id, its current stage, the next step,
+        the user's and Insurer's Telegram replies since Pacto first messaged about it, and what Pacto already sent.
+        session_start is the calendar event's start (ISO, +05:30). Pass the user's and Insurer's Telegram chat_ids."""
+        from app import canon as _canon
+        try:
+            st = datetime.fromisoformat(session_start.replace("Z", "+00:00"))
+            st = st if st.tzinfo else st.replace(tzinfo=IST)
+            st = st.astimezone(IST)
+        except Exception:
+            return {"error": "session_start must be an ISO time, e.g. 2026-10-04T15:00:00+05:30"}
+        sid = f"{user_id.lower()}-{st.strftime('%Y-%m-%d-%H%M')}"
+        sub_id = f"v1-sub-{user_id.lower()}"
+        sub = state["subscriptions"].get(sub_id, {})
+        pres = [p for p in state["presentations"].values() if p["merchant_presentation_reference"] in (f"miss-{sid}", f"miss-{sid}-2")]
+        pre = ([p for p in pres if p["status"] != "DELETED"] or pres or [None])[-1]
+        greqs = [r for r in state["guardian_requests"].values() if r["subscription_id"] == sub_id and pre and
+                 r.get("presentation_id") in [p["presentation_id"] for p in pres]]
+        greq = greqs[-1] if greqs else None
+        payout = next((p for k, p in state["payouts"].items() if p.get("clientReferenceId") == f"forfeit-{sid}" and "#failed#" not in k), None)
+        link = state.get("pl_links", {}).get(f"stake-{sid}")
+        outcome = state["sessions"].get(user_id.lower(), {}).get(sid, {}).get("outcome")
+        st_iso = st.isoformat()
+        sent_user = [s for s in state.get("tg_sent", []) if user_chat_id and s["chat_id"] == str(user_chat_id) and s["date"] >= st_iso]
+        asked_at = sent_user[0]["date"] if sent_user else None
+        def replies(chat):
+            if not chat:
+                return []
+            since = asked_at or st_iso
+            return [{"date": x["date"], "text": x.get("text"), "transcript": x.get("transcript"), "voice": bool(x.get("voice"))}
+                    for x in state["tg_messages"] if str(x["chat_id"]) == str(chat) and x["date"] > since]
+        now_iso = datetime.now(IST).isoformat(timespec="seconds")
+        if payout:
+            stage, nxt = "PAID_OUT", "Done. Nothing more to do for this session."
+        elif outcome == "ATTENDED":
+            stage, nxt = "ATTENDED", "Done."
+        elif pre and pre["status"] == "COMPLETED":
+            stage, nxt = "CHARGED_PAYOUT_PENDING", f"R9: create_payout with client_reference_id forfeit-{sid}."
+        elif sub.get("status") == "HALTED":
+            stage, nxt = "AUTOPAY_FAILED", f"R8: payment link with reference stake-{sid}; check it with pinelabs_get_payment_link."
+        elif greq and greq["status"] == "APPROVED":
+            stage, nxt = "PAUSED", "Done: pause approved. Record PAUSED once; do not message again."
+        elif greq and greq["status"] == "OVERRIDDEN":
+            stage, nxt = "CODE_USED", "Done: emergency code used. Record CODE_USED once; do not message again."
+        elif greq and greq["status"] == "REJECTED":
+            stage, nxt = "INSURER_REJECTED", "R6 REJECT: ask the user about a code once, then act on their reply."
+        elif greq and greq["status"] == "PENDING_GUARDIAN":
+            stage, nxt = "WAITING_FOR_INSURER", "R6: read insurer_replies; APPROVE or REJECT -> record_guardian_decision. Otherwise wait."
+        elif pre and pre["status"] == "PENDING":
+            ready = now_iso >= (pre.get("debit_allowed_after") or now_iso)
+            stage = "READY_TO_DEBIT" if ready and not replies(user_chat_id) else "IN_NOTICE_WINDOW"
+            nxt = ("R7: create_debit." if stage == "READY_TO_DEBIT" else
+                   "R5: act on user_replies (ill -> pause request; was there -> dispute). Otherwise wait for the notice window.")
+        elif pre and pre["status"] == "FAILED":
+            stage, nxt = "DEBIT_FAILED", "R8: create_merchant_retry."
+        elif pre and pre["status"] == "DELETED":
+            stage, nxt = "DISPUTE_OPEN", "R5 WAS_THERE: wait for the Insurer's decision on the proof."
+        elif asked_at:
+            stage, nxt = "ASKED_WAITING_FOR_REPLY", "R5: act on user_replies. If none and 30 minutes have passed since asked_at, R4."
+        else:
+            stage, nxt = "NOT_CHECKED", "R2: check attendance."
+        return {"session_id": sid, "stage": stage, "next_step": nxt, "now": now_iso, "asked_at": asked_at,
+                "charge_reference": f"miss-{sid}", "payout_reference": f"forfeit-{sid}",
+                "subscription_status": sub.get("status"),
+                "charge_request": pre and {k: pre.get(k) for k in ("presentation_id", "status", "debit_allowed_after", "failure_reason")},
+                "insurer_request": greq and {k: greq.get(k) for k in ("request_id", "status", "reason")},
+                "payment_link": link, "attendance_recorded": outcome,
+                "user_replies": replies(user_chat_id), "insurer_replies": replies(insurer_chat_id),
+                "pacto_already_sent_to_user": [s["text"][:120] for s in sent_user][-5:]}
 
     # ------------------------------------------------------------------ Telegram (REAL Bot API)
     def tg_base() -> str:
