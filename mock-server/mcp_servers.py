@@ -524,6 +524,8 @@ def build_mcp(app, state: Dict[str, Any]):
         state["tg_messages"] = state["tg_messages"][-500:]
         return {"ok": True, "new_updates": len(res.get("result", []))}
 
+    state["_poll_telegram"] = poll_updates   # used by the autopilot
+
     @every_server()
     async def telegram_find_chats() -> dict:
         """REAL Telegram: list the people and groups that have messaged the Pacto bot, with their chat_id.
