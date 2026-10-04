@@ -433,11 +433,20 @@ def build_mcp(app, state: Dict[str, Any]):
             "merchant_payment_link_reference": merchant_payment_link_reference,
             "expire_by": (datetime.now(_tz.utc) + timedelta(minutes=int(expire_minutes))).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        prior = state.setdefault("pl_links", {}).get(merchant_payment_link_reference)
+        if prior and prior.get("payment_link_id"):
+            current = await pl_call("GET", f"/api/pay/v1/paymentlink/{prior['payment_link_id']}")
+            if str(current.get("status", "")).upper() not in ("EXPIRED", "CANCELLED", "FAILED"):
+                return {**current, "already_created": True,
+                        "note": "A link with this reference already exists; reuse it, do not send a new one."}
         cust = {k: v for k, v in {"first_name": customer_name, "mobile_number": customer_phone,
                                     "email_id": customer_email, "country_code": "91" if customer_phone else ""}.items() if v}
         if cust:
             body["customer"] = cust
-        return await pl_call("POST", "/api/pay/v1/paymentlink", body)
+        res = await pl_call("POST", "/api/pay/v1/paymentlink", body)
+        if res.get("payment_link_id"):
+            state.setdefault("pl_links", {})[merchant_payment_link_reference] = {"payment_link_id": res["payment_link_id"]}
+        return res
 
     @every_server()
     async def pinelabs_get_payment_link(payment_link_id: str) -> dict:
@@ -524,6 +533,8 @@ def build_mcp(app, state: Dict[str, Any]):
         state["tg_messages"] = state["tg_messages"][-500:]
         return {"ok": True, "new_updates": len(res.get("result", []))}
 
+    state["_poll_telegram"] = poll_updates   # used by the autopilot
+
     @every_server()
     async def telegram_find_chats() -> dict:
         """REAL Telegram: list the people and groups that have messaged the Pacto bot, with their chat_id.
@@ -539,7 +550,12 @@ def build_mcp(app, state: Dict[str, Any]):
     async def telegram_send_message(chat_id: str, text: str) -> dict:
         """REAL Telegram: send a text message from the Pacto bot to a person or group (chat_id).
         Calls the Telegram Bot API sendMessage."""
-        return await tg("sendMessage", chat_id=chat_id, text=text)
+        res = await tg("sendMessage", chat_id=chat_id, text=text)
+        if res.get("ok"):
+            state.setdefault("tg_sent", []).append({"chat_id": str(chat_id), "date": datetime.now(IST).isoformat(timespec="seconds"),
+                                                    "text": text})
+            state["tg_sent"] = state["tg_sent"][-300:]
+        return res
 
     @every_server()
     async def telegram_send_voice(chat_id: str, audio_url: str, caption: str = "") -> dict:
@@ -548,6 +564,9 @@ def build_mcp(app, state: Dict[str, Any]):
         res = await tg("sendVoice", chat_id=chat_id, voice=audio_url, caption=caption)
         if not res.get("ok"):
             res = await tg("sendAudio", chat_id=chat_id, audio=audio_url, caption=caption)
+        if res.get("ok"):
+            state.setdefault("tg_sent", []).append({"chat_id": str(chat_id), "date": datetime.now(IST).isoformat(timespec="seconds"),
+                                                    "text": f"[voice note] {caption}".strip()})
         return res
 
     @every_server()
@@ -585,7 +604,10 @@ def build_mcp(app, state: Dict[str, Any]):
                     m["transcript"] = {"error": "GETFILE_FAILED", "detail": f}
                 item["transcript"] = m["transcript"]
             out.append(item)
+        sent = [s for s in state.get("tg_sent", []) if s["chat_id"] == str(chat_id).strip()][-10:]
         result = {"chat_id": chat_id, "messages": out,
+                  "pacto_already_sent": sent,
+                  "rule": "Do not repeat a message that is already in pacto_already_sent for the same session.",
                   "total_messages_in_this_chat": len(in_chat),
                   "latest_message_at": in_chat[-1]["date"] if in_chat else None,
                   "telegram_poll": poll}
