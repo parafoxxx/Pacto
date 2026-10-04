@@ -1166,12 +1166,154 @@ from mcp_servers import build_mcp
 MCP_SERVERS = build_mcp(app, S)
 
 
+# ----------------------------------------------------------------------------- Autopilot: start Pacto on AgenticOrg
+# Workflow runs on the platform fail (E1001), so this starts the agent through AgenticOrg's own
+# "run agent" API: every few minutes, and immediately when Mukund or Vaibhav messages the bot.
+import os as _os
+import httpx as _httpx
+
+AUTOPILOT = {"enabled": True, "token": None, "token_exp": 0, "running": False, "pending": None,
+             "last_seen_message_id": {}, "runs": [], "errors": []}
+SCHEDULE_TASK = ("Run your session check now. List Google Calendar events titled 'Pacto gym: mukund', "
+                 "'Pacto study: mukund' or 'Pacto walk: mukund' that ended in the last 24 hours, and follow your "
+                 "rules R1 to R11 for each. Read Telegram replies from Mukund and Vaibhav and act on them. "
+                 "Report every decision with its rule number.")
+
+
+def _ap_cfg():
+    env = _os.environ.get
+    return {"base": env("AGENTICORG_BASE", "https://agenticorg.hackathon.pinelabs.com").rstrip("/"),
+            "email": env("AGENTICORG_EMAIL"), "password": env("AGENTICORG_PASSWORD"),
+            "agent_id": env("PACTO_AGENT_ID"), "every": int(env("AUTOPILOT_SCHEDULE_SECONDS", "300")),
+            "chats": [c.strip() for c in env("AUTOPILOT_TRIGGER_CHATS", "").split(",") if c.strip()]}
+
+
+def _ap_log(kind: str, **kw):
+    AUTOPILOT[kind].append({"time": iso(), **kw})
+    AUTOPILOT[kind] = AUTOPILOT[kind][-50:]
+
+
+async def _ap_token(cfg) -> Optional[str]:
+    if AUTOPILOT["token"] and AUTOPILOT["token_exp"] > time.time() + 120:
+        return AUTOPILOT["token"]
+    if not cfg["email"] or not cfg["password"]:
+        _ap_log("errors", error="Set AGENTICORG_EMAIL and AGENTICORG_PASSWORD on the server")
+        return None
+    try:
+        async with _httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{cfg['base']}/api/v1/auth/login", json={"email": cfg["email"], "password": cfg["password"]})
+        body = r.json()
+    except Exception as e:
+        _ap_log("errors", error=f"Login failed: {str(e)[:200]}")
+        return None
+    if r.status_code != 200 or "access_token" not in body:
+        _ap_log("errors", error=f"Login refused ({r.status_code}): {str(body)[:300]}")
+        return None
+    AUTOPILOT["token"], AUTOPILOT["token_exp"] = body["access_token"], time.time() + 50 * 60
+    return AUTOPILOT["token"]
+
+
+async def _ap_run(reason: str, task: str):
+    """Start one Pacto run; if one is already running, queue this one to run right after."""
+    if AUTOPILOT["running"]:
+        AUTOPILOT["pending"] = (reason, task)
+        return
+    AUTOPILOT["running"] = True
+    try:
+        while True:
+            cfg = _ap_cfg()
+            tok = await _ap_token(cfg)
+            if not tok or not cfg["agent_id"]:
+                if not cfg["agent_id"]:
+                    _ap_log("errors", error="Set PACTO_AGENT_ID on the server")
+                break
+            started = time.time()
+            try:
+                async with _httpx.AsyncClient(timeout=300) as c:
+                    r = await c.post(f"{cfg['base']}/api/v1/agents/{cfg['agent_id']}/run",
+                                     headers={"Authorization": f"Bearer {tok}"}, json={"inputs": {"task": task}})
+                if r.status_code == 401:
+                    AUTOPILOT["token"] = None
+                try:
+                    out = r.json()
+                except Exception:
+                    out = r.text
+                _ap_log("runs", reason=reason, http_status=r.status_code, seconds=round(time.time() - started),
+                        result=str(out)[:1500])
+            except Exception as e:
+                _ap_log("errors", error=f"Run failed ({reason}): {str(e)[:200]}")
+            if not AUTOPILOT["pending"]:
+                break
+            reason, task = AUTOPILOT["pending"]
+            AUTOPILOT["pending"] = None
+    finally:
+        AUTOPILOT["running"] = False
+
+
+async def _ap_check_telegram(cfg):
+    poll = S.get("_poll_telegram")
+    if not poll or not cfg["chats"]:
+        return
+    await poll()
+    for m in S["tg_messages"]:
+        chat = str(m["chat_id"])
+        if chat not in cfg["chats"]:
+            continue
+        last = AUTOPILOT["last_seen_message_id"].get(chat)
+        if last is None:
+            AUTOPILOT["last_seen_message_id"][chat] = m["message_id"]   # don't react to old messages on start-up
+            continue
+        if m["message_id"] > last:
+            AUTOPILOT["last_seen_message_id"][chat] = m["message_id"]
+            what = m.get("text") or "[voice note]"
+            asyncio.create_task(_ap_run(f"telegram message from {m.get('from_name')}",
+                                        f"New Telegram message from {m.get('from_name')} (chat_id {chat}): {what!r}. "
+                                        + SCHEDULE_TASK))
+
+
+async def _autopilot_loop():
+    last_scheduled = 0.0
+    while True:
+        try:
+            cfg = _ap_cfg()
+            if AUTOPILOT["enabled"] and cfg["agent_id"]:
+                await _ap_check_telegram(cfg)
+                if time.time() - last_scheduled >= cfg["every"]:
+                    last_scheduled = time.time()
+                    asyncio.create_task(_ap_run("schedule", SCHEDULE_TASK))
+        except Exception as e:
+            _ap_log("errors", error=f"Autopilot loop: {str(e)[:200]}")
+        await asyncio.sleep(15)
+
+
+@app.get("/_mock/autopilot", tags=["test controls"])
+async def autopilot_status():
+    cfg = _ap_cfg()
+    return {"enabled": AUTOPILOT["enabled"], "running": AUTOPILOT["running"], "agent_id": cfg["agent_id"],
+            "schedule_seconds": cfg["every"], "trigger_chats": cfg["chats"],
+            "logged_in": bool(AUTOPILOT["token"]), "runs": AUTOPILOT["runs"][-10:], "errors": AUTOPILOT["errors"][-10:]}
+
+
+@app.post("/_mock/autopilot", tags=["test controls"])
+async def autopilot_control(payload: Dict[str, Any]):
+    """{"enabled": false} pauses the autopilot; {"run_now": true} starts one Pacto run immediately."""
+    if "enabled" in payload:
+        AUTOPILOT["enabled"] = bool(payload["enabled"])
+    if payload.get("run_now"):
+        asyncio.create_task(_ap_run("manual", SCHEDULE_TASK))
+    return await autopilot_status()
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
     async with contextlib.AsyncExitStack() as stack:
         for _, server in MCP_SERVERS:
             await stack.enter_async_context(server.session_manager.run())
-        yield
+        loop_task = asyncio.create_task(_autopilot_loop())
+        try:
+            yield
+        finally:
+            loop_task.cancel()
 
 
 app.router.lifespan_context = _lifespan
