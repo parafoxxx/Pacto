@@ -1228,20 +1228,37 @@ async def _ap_run(reason: str, task: str):
                     _ap_log("errors", error="Set PACTO_AGENT_ID on the server")
                 break
             started = time.time()
+            started_iso = iso()
+            gateway_cut = False
             try:
-                async with _httpx.AsyncClient(timeout=300) as c:
+                async with _httpx.AsyncClient(timeout=float(_os.environ.get("AUTOPILOT_HTTP_TIMEOUT", "40"))) as c:
                     r = await c.post(f"{cfg['base']}/api/v1/agents/{cfg['agent_id']}/run",
                                      headers={"Authorization": f"Bearer {tok}"}, json={"inputs": {"task": task}})
                 if r.status_code == 401:
                     AUTOPILOT["token"] = None
+                gateway_cut = r.status_code in (502, 503, 504)
                 try:
                     out = r.json()
                 except Exception:
                     out = r.text
-                _ap_log("runs", reason=reason, http_status=r.status_code, seconds=round(time.time() - started),
-                        result=str(out)[:1500])
+                status = ("STARTED: gateway timed out after ~30 s; Pacto keeps running on AgenticOrg"
+                          if gateway_cut else ("COMPLETED" if r.status_code == 200 else "REFUSED"))
+                _ap_log("runs", reason=reason, http_status=r.status_code, status=status,
+                        seconds=round(time.time() - started),
+                        result=("(gateway page omitted)" if gateway_cut else str(out)[:1500]), started=started_iso)
+            except _httpx.TimeoutException:
+                gateway_cut = True
+                _ap_log("runs", reason=reason, http_status=None, started=started_iso,
+                        status="STARTED: no reply within the timeout; Pacto keeps running on AgenticOrg")
             except Exception as e:
                 _ap_log("errors", error=f"Run failed ({reason}): {str(e)[:200]}")
+            if gateway_cut:
+                # The run continues on the platform: give it time to finish before starting another,
+                # then record how many of our tools it called, as proof the run really happened.
+                await asyncio.sleep(int(_os.environ.get("AUTOPILOT_RUN_GRACE_SECONDS", "150")))
+                calls = [e["path"].split("?")[0] for e in S["log"] if e["time"] >= started_iso]
+                AUTOPILOT["runs"][-1]["tool_calls_seen"] = len(calls)
+                AUTOPILOT["runs"][-1]["calls"] = calls[-15:]
             if not AUTOPILOT["pending"]:
                 break
             reason, task = AUTOPILOT["pending"]
