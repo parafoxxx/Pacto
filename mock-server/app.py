@@ -136,6 +136,7 @@ def seed(state: Dict[str, Any]) -> None:
     state["guardians"][sub_id] = {
         "guardian_id": f"grd_{user}", "subscription_id": sub_id, "name": env("SEED_INSURER_NAME", "Vaibhav"),
         "phone": env("SEED_INSURER_PHONE", "+910000000000"), "vpa": env("SEED_INSURER_VPA", "vaibhav@okaxis"),
+        "telegram_chat_id": env("SEED_INSURER_TELEGRAM_CHAT_ID", ""), "user_name": env("SEED_USER_NAME", user.title()),
         "authorities": ["PAUSE", "CANCEL"], "override_codes_left": int(env("SEED_OVERRIDE_CODES", "4")),
         "status": "ACTIVE", "created_at": iso()}
     state["wallets"][f"bw-{user}"] = {"wallet_id": f"bw-{user}", "customer_id": user, "wallet_name": "Pacto coins",
@@ -527,6 +528,7 @@ async def add_guardian(subscription_id: str, payload: Dict[str, Any], authorizat
     g = {"guardian_id": "grd_" + uuid.uuid4().hex[:10], "subscription_id": subscription_id,
          "name": payload.get("name"), "phone": payload.get("phone"), "vpa": payload.get("vpa"),
          "authorities": payload.get("authorities", ["PAUSE", "CANCEL"]),
+         "telegram_chat_id": payload.get("telegram_chat_id", ""), "user_name": payload.get("user_name", ""),
          "override_codes_left": int(payload.get("override_codes", 4)), "status": "ACTIVE", "created_at": iso()}
     S["guardians"][subscription_id] = g
     return g
@@ -547,7 +549,35 @@ async def guardian_request(subscription_id: str, payload: Dict[str, Any], author
            "status": "PENDING_GUARDIAN", "created_at": iso(),
            "expires_at": iso(now() + timedelta(hours=24))}
     S["guardian_requests"][rid] = req
+    req["insurer_notified"] = await notify_guardian(S["guardians"][subscription_id], req)
     return req
+
+
+async def notify_guardian(g: Dict[str, Any], req: Dict[str, Any]) -> Any:
+    """The guardian is told of every request the moment it is made, so it never depends on the agent."""
+    import os
+    import httpx
+    chat, token = g.get("telegram_chat_id"), os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not chat or not token:
+        return {"sent": False, "why": "No guardian Telegram chat or bot token configured"}
+    session = ""
+    pre = S["presentations"].get(req.get("presentation_id") or "")
+    if pre:
+        session = pre["merchant_presentation_reference"].replace("miss-", "")
+    who = g.get("user_name") or "User"
+    what = "pause" if req["type"] == "PAUSE" else "cancel"
+    text = (f"{who} ne {session + ' ke liye ' if session else ''}{what} maanga hai. "
+            f"Wajah: {req.get('reason') or 'nahi batayi'}. Reply APPROVE ya REJECT.")
+    base = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{base}/bot{token}/sendMessage", json={"chat_id": chat, "text": text})
+        ok = bool(r.json().get("ok"))
+    except Exception as e:
+        return {"sent": False, "why": str(e)[:150]}
+    if ok:
+        S["tg_sent"].append({"chat_id": str(chat), "date": iso(), "text": text})
+    return {"sent": ok, "text": text}
 
 
 def apply_request(req: Dict[str, Any]):
