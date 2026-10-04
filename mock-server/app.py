@@ -91,11 +91,27 @@ def new_state() -> Dict[str, Any]:
         "walks": {},       # GPS walks, by walk_id
         "tg_offset": 0,    # Telegram getUpdates offset
         "tg_messages": [], # Telegram messages received by the Pacto bot
+        "tg_sent": [],     # Telegram messages Pacto sent
+        "pl_links": {},    # Pine Labs payment links by reference
         "log": [],
     }
 
 
 S = new_state()
+
+import re as _re
+_SESSION_RE = _re.compile(r"^(?P<prefix>(?:miss|forfeit|stake|coins)-)?(?P<user>[a-z0-9_]+?)-(?P<date>\d{4}-\d{2}-\d{2})[T _-]?(?P<hh>\d{2}):?(?P<mm>\d{2})(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?(?P<suffix>-\d)?$", _re.I)
+
+
+def canon(ref: Optional[str]) -> Optional[str]:
+    """Normalise any session-based reference to one form, e.g. miss-mukund-2026-10-04T15:00:00+05:30
+    -> miss-mukund-2026-10-04-1500, so lookups never miss because of formatting."""
+    if not ref:
+        return ref
+    m = _SESSION_RE.match(str(ref).strip())
+    if not m:
+        return ref
+    return f"{(m['prefix'] or '').lower()}{m['user'].lower()}-{m['date']}-{m['hh']}{m['mm']}{m['suffix'] or ''}"
 
 
 def seed(state: Dict[str, Any]) -> None:
@@ -321,7 +337,10 @@ async def create_presentation(subscription_id: str, payload: Dict[str, Any], aut
     sub = get_sub(subscription_id)
     if sub["status"] != "ACTIVE":
         return err(409, "INVALID_STATE", f"Subscription is {sub['status']}")
-    ref = payload.get("merchant_presentation_reference", "")
+    ref = canon(payload.get("merchant_presentation_reference", ""))
+    for p in S["presentations"].values():
+        if ref and p["merchant_presentation_reference"] == ref and p["status"] not in ("DELETED",):
+            return {**p, "already_exists": True, "note": "A charge request for this session already exists; continue from its status."}
     if len(ref) > 50:
         return err(400, "INVALID_REQUEST", "merchant_presentation_reference must be at most 50 characters")
     amount = money(payload.get("amount"))
@@ -340,7 +359,7 @@ def find_presentation(payload: Dict[str, Any]) -> Dict[str, Any]:
     pid = payload.get("presentation_id")
     if pid and pid in S["presentations"]:
         return S["presentations"][pid]
-    ref = payload.get("merchant_presentation_reference")
+    ref = canon(payload.get("merchant_presentation_reference"))
     for p in S["presentations"].values():
         if ref and p["merchant_presentation_reference"] == ref:
             return p
@@ -419,9 +438,11 @@ async def merchant_retry(payload: Dict[str, Any], authorization: Optional[str] =
 async def presentation_by_reference(merchant_presentation_reference: str, authorization: Optional[str] = Header(None)):
     """Find a charge request by its merchant reference (Pine Labs offers get_presentation_by_merchant_reference)."""
     require_bearer(authorization)
-    for p in S["presentations"].values():
-        if p["merchant_presentation_reference"] == merchant_presentation_reference:
-            return p
+    ref = canon(merchant_presentation_reference)
+    matches = [p for p in S["presentations"].values() if p["merchant_presentation_reference"] == ref]
+    live = [p for p in matches if p["status"] != "DELETED"]
+    if live or matches:
+        return (live or matches)[-1]
     return err(404, "PRESENTATION_NOT_FOUND", "No presentation with this reference")
 
 
@@ -453,7 +474,7 @@ async def create_payout(payload: Dict[str, Any], authorization: Optional[str] = 
     r = await chaos("pinelabs.payout")
     if r is not None and not isinstance(r, str):
         return r
-    ref = payload.get("clientReferenceId")
+    ref = canon(payload.get("clientReferenceId"))
     if not ref:
         return err(400, "INVALID_REQUEST", "clientReferenceId is required")
     if ref in S["payouts"]:
@@ -484,7 +505,7 @@ async def list_payouts(clientReferenceId: Optional[str] = None, authorization: O
     for key, p in S["payouts"].items():
         if p.get("status") == "SCHEDULED" and time.time() >= p.get("_success_at", 0):
             p["status"] = "SUCCESS"
-        if clientReferenceId is None or p["clientReferenceId"] == clientReferenceId:
+        if clientReferenceId is None or p["clientReferenceId"] == canon(clientReferenceId):
             items.append({k: v for k, v in p.items() if not k.startswith("_")})
     return {"data": items}
 
@@ -612,7 +633,7 @@ async def load_wallet(payload: Dict[str, Any], authorization: Optional[str] = He
     w = S["wallets"].get(payload.get("wallet_id", ""))
     if not w:
         return err(404, "WALLET_NOT_FOUND", "No such wallet")
-    ref = payload.get("reference")
+    ref = canon(payload.get("reference"))
     if not ref:
         return err(400, "INVALID_REQUEST", "reference is required")
     if ref in S["wallet_loads"]:
@@ -657,7 +678,7 @@ async def record_attendance(payload: Dict[str, Any], authorization: Optional[str
     """NEW: record a session's outcome (ATTENDED, MISSED, PAUSED, CODE_USED) and return the streak and the coins
     earned. Recording the same session again updates it instead of counting twice."""
     require_token(authorization)
-    uid, sid, outcome = payload.get("user_id"), payload.get("session_id"), payload.get("outcome")
+    uid, sid, outcome = payload.get("user_id"), canon(payload.get("session_id")), payload.get("outcome")
     if not uid or not sid or outcome not in ("ATTENDED", "MISSED", "PAUSED", "CODE_USED"):
         return JSONResponse(status_code=400, content={"error": "user_id, session_id and outcome (ATTENDED, MISSED, PAUSED, CODE_USED) are required"})
     prev = S["sessions"].setdefault(uid, {}).get(sid)
